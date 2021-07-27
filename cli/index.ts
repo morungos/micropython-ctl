@@ -520,26 +520,29 @@ const reset = async (cmdObj) => {
   process.exit(0)
 }
 
-const sync = async (directory = './') => {
+const sync = async (directory = './', targetPath: string = '/', cmdObj?: any) => {
   // console.log('sync', directory)
+  const dryRun = cmdObj.dryRun;
   try {
     await ensureConnectedDevice()
     console.log('Getting file list from device...')
     await micropython.gcCollect()
-    const filesOnDevice = await micropython.listFiles('/', { recursive: true, includeSha256: true })
+    const filesOnDevice = await micropython.listFiles(targetPath, { recursive: true, includeSha256: true })
     const filesOnDeviceByFilename: { [fn: string]: FileListEntry } = {}
     for (const entry of filesOnDevice.reverse()) {
-      if (entry.filename === '/') continue
-      filesOnDeviceByFilename[entry.filename] = entry
+      const rel = path.relative(targetPath, entry.filename);
+      if (rel === '') continue
+      filesOnDeviceByFilename[rel] = entry
     }
-
-    // console.log(filesOnDeviceByFilename)
 
     // console.log('Building local file list...')
     interface FileEntry {
       filename: string
       isDir: boolean
       sha256: string | null
+    }
+    interface RelativeFileEntryIndex {
+      [index: string]: FileEntry;
     }
     const getFilesInDir = (_dirname) => {
       const ret: FileEntry[] = []
@@ -562,47 +565,59 @@ const sync = async (directory = './') => {
       return ret
     }
     const filesLocal = getFilesInDir(directory)
-    // console.log(filesLocal)
-    const filesLocalHashes = {}
+    // console.log("filesLocal", filesLocal)
+    const filesLocalHashes: RelativeFileEntryIndex = {}
     for (const entry of filesLocal) {
-      filesLocalHashes[entry.filename] = entry
+      const rel = path.relative(directory, entry.filename);
+
+      // at this point, we can ignore stuff
+      if (/__pycache__/.test(rel)) {
+        continue;
+      }
+      filesLocalHashes[rel] = entry
     }
+    // console.log("filesLocalHashes", filesLocalHashes)
 
     // console.log("Computing actions...")
     // Find files to delete (exist on device but not local)
     for (const fn in filesOnDeviceByFilename) {
       if (Object.prototype.hasOwnProperty.call(filesOnDeviceByFilename, fn)) {
-        const fullFn = path.join(directory, fn)
-        if (!filesLocalHashes[fullFn]) {
-          console.log(`delete ${fn} because not existing locally`)
-          await micropython.remove(fn)
+        const absTargetFn = path.join(targetPath, fn)
+        if (!filesLocalHashes[fn]) {
+          console.log(`delete ${absTargetFn} because not existing locally`)
+          if (! dryRun)
+            await micropython.remove(absTargetFn, filesOnDeviceByFilename[fn].isDir)
         }
       }
     }
 
     // Find files to upload or update
-    for (const entry of filesLocal) {
-      let targetFn = directory === './' ? entry.filename : entry.filename.substr(directory.length)  // remove local path prefix
-      if (!targetFn.startsWith('/')) targetFn = '/' + targetFn
-      // console.log(entry, targetFn)
+    for (const [relTargetFn, entry] of Object.entries(filesLocalHashes)) {
+      // let targetFn = directory === './' ? entry.filename : entry.filename.substr(directory.length)  // remove local path prefix
+      // if (!targetFn.startsWith('/')) targetFn = targetPath + targetFn
+      const absTargetFn = path.join(targetPath, relTargetFn)
 
-      if (filesOnDeviceByFilename[targetFn]) {
-        if (entry.isDir && filesOnDeviceByFilename[targetFn].isDir) continue
-        const hashOnDevice = filesOnDeviceByFilename[targetFn].sha256
+      if (filesOnDeviceByFilename[relTargetFn]) {
+        if (entry.isDir && filesOnDeviceByFilename[relTargetFn].isDir) continue
+        const hashOnDevice = filesOnDeviceByFilename[relTargetFn].sha256
         if (hashOnDevice !== entry.sha256) {
-          console.log(`upload ${targetFn}`)
-          await micropython.remove(targetFn)
+          console.log(`upload ${absTargetFn}`)
+          if (! dryRun)
+            await micropython.remove(absTargetFn)
           const data = Buffer.from(fs.readFileSync(entry.filename))
-          await micropython.putFile(targetFn, data)
+          if (! dryRun)
+            await micropython.putFile(absTargetFn, data)
         }
       } else {
         if (entry.isDir) {
-          console.log(`create directory ${targetFn}`)
-          await micropython.mkdir(targetFn)
+          console.log(`create directory ${absTargetFn}`)
+          if (! dryRun)
+            await micropython.mkdir(absTargetFn)
         } else {
-          console.log(`upload ${entry.filename} -> ${targetFn}`)
+          console.log(`upload ${entry.filename} -> ${absTargetFn}`)
           const data = Buffer.from(fs.readFileSync(entry.filename))
-          await micropython.putFile(targetFn, data)
+          if (! dryRun)
+            await micropython.putFile(absTargetFn, data)
         }
       }
     }
@@ -749,7 +764,8 @@ program
 
 // Command: sync
 program
-  .command('sync [directory]')
+  .command('sync [directory] [target]')
+  .option('-n, --dry-run', 'Show changes but don\'t make them')
   .description('Sync a local directory onto the device root (upload new/changes files, delete missing)')
   .action(sync);
 
